@@ -225,6 +225,10 @@ else {
     }
 })();
 // ─── Slack delivery ───────────────────────────────────────────────────────────
+// Uses the 3-step Slack files API:
+//   1. files.getUploadURLExternal  → get upload URL
+//   2. PUT the file to the upload URL
+//   3. files.completeUploadExternal → attach to channel
 async function deliverSlack(reportFile, project, stats, analysis, slackCfg) {
     const token = slackCfg?.token ?? process.env.SLACK_BOT_TOKEN;
     const channelId = slackCfg?.channelId ?? process.env.SLACK_CHANNEL_ID;
@@ -247,6 +251,7 @@ async function deliverSlack(reportFile, project, stats, analysis, slackCfg) {
         : `${emoji} ${stats.passed}/${stats.total} scenarios passed (${passRate}%)`;
     console.log('\n📤 Delivering to Slack…');
     try {
+        // Step 1: get upload URL
         const uploadUrlRes = await slackApiCall('files.getUploadURLExternal', token, {
             filename: fileName,
             length: String(fileSize)
@@ -255,7 +260,9 @@ async function deliverSlack(reportFile, project, stats, analysis, slackCfg) {
             throw new Error(`getUploadURLExternal failed: ${uploadUrlRes.error}`);
         }
         const { upload_url, file_id } = uploadUrlRes;
+        // Step 2: upload the file
         await httpPut(upload_url, fileContent, 'text/html; charset=utf-8');
+        // Step 3: complete upload and attach to channel
         const completeRes = await slackApiCall('files.completeUploadExternal', token, {
             files: JSON.stringify([{ id: file_id, title: `${project} — Test Report` }]),
             channel_id: channelId,
@@ -314,7 +321,7 @@ function httpPut(url, body, contentType) {
             }
         };
         const req = lib.request(options, (res) => {
-            res.resume();
+            res.resume(); // drain
             res.on('end', () => {
                 if ((res.statusCode ?? 0) >= 400) {
                     reject(new Error(`Upload failed: HTTP ${res.statusCode}`));
@@ -330,6 +337,8 @@ function httpPut(url, body, contentType) {
     });
 }
 // ─── Generic webhook delivery ─────────────────────────────────────────────────
+// POSTs a JSON payload with report metadata. The HTML file is NOT uploaded —
+// the webhook receives enough data to link to or summarise the result.
 async function deliverWebhook(reportFile, project, stats, analysis, webhookCfg) {
     const url = webhookCfg?.url ?? process.env.WEBHOOK_URL;
     const token = webhookCfg?.token ?? process.env.WEBHOOK_TOKEN;
@@ -414,6 +423,7 @@ function parseArgs(argv) {
     return result;
 }
 // ─── Demo data ────────────────────────────────────────────────────────────────
+// Raw Cucumber JSON format — same shape as what cucumber-js outputs
 function getDemoData() {
     return [
         {
