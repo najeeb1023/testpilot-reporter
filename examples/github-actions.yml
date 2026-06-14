@@ -1,0 +1,152 @@
+# ────────────────────────────────────────────────────────────────────────────
+# testpilot-reporter — GitHub Actions example
+#
+# This workflow runs after your test workflow completes, downloads the
+# Cucumber JSON artifact, generates an HTML + PDF report, uploads both as
+# artifacts, and posts the PDF to Slack.
+#
+# Required secrets (set in repo Settings → Secrets and variables → Actions):
+#   ANTHROPIC_API_KEY   — optional; enables the AI analysis section
+#   SLACK_BOT_TOKEN     — Slack Bot OAuth token (xoxb-...)
+#   SLACK_CHANNEL_ID    — target Slack channel ID
+#
+# Required variables (Settings → Variables, or inline below):
+#   PROJECT_NAME        — name shown on report cover (e.g. "My App")
+#   ENVIRONMENT         — environment label (e.g. STAGING, LIVE)
+# ────────────────────────────────────────────────────────────────────────────
+
+name: Test Report
+
+on:
+  # Trigger after your cucumber test workflow finishes.
+  # Replace "Run Cucumber Tests" with your actual workflow name.
+  workflow_run:
+    workflows: ["Run Cucumber Tests"]
+    types: [completed]
+
+  # Allow manual runs from the Actions tab
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Workflow run ID to pull artifacts from (leave blank for latest)'
+        required: false
+
+jobs:
+  generate-report:
+    name: Generate Test Report
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Node setup ──────────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 3. Playwright for PDF generation ───────────────────────────────────
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # ── 4. Download Cucumber JSON from the test run ────────────────────────
+      # Your test workflow must upload an artifact named 'cucumber-report-json'
+      # containing cucumber-report.json. Adjust the name to match yours.
+      - name: Download Cucumber JSON artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cucumber-report-json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
+          path: test-results/
+
+      # ── 5. Generate HTML report ────────────────────────────────────────────
+      - name: Generate HTML report
+        if: always()
+        run: |
+          npx testpilot-report \
+            --input  test-results/cucumber-report.json \
+            --output test-results/report.html \
+            --project "${{ vars.PROJECT_NAME || 'My Project' }}" \
+            --environment "${{ vars.ENVIRONMENT || 'STAGING' }}"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Optional: override Claude model
+          # ANTHROPIC_MODEL: claude-opus-4-5
+
+      # ── 6. Generate PDF ────────────────────────────────────────────────────
+      - name: Generate PDF report
+        if: always()
+        run: |
+          npx testpilot-pdf \
+            --input  test-results/report.html \
+            --output test-results/report.pdf
+
+      # ── 7. Upload as artifacts ─────────────────────────────────────────────
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{ github.event.workflow_run.run_number || github.run_number }}
+          path: |
+            test-results/report.html
+            test-results/report.pdf
+          retention-days: 30
+
+      # ── 8. Post PDF to Slack ───────────────────────────────────────────────
+      # Remove this step if you don't use Slack.
+      - name: Install jq
+        if: always()
+        run: sudo apt-get install -y jq
+
+      - name: Post PDF to Slack
+        if: always()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number || github.run_number }}
+        run: |
+          # 1. Post a text notification
+          curl -s -X POST \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"channel\": \"$SLACK_CHANNEL_ID\",
+              \"text\": \"📊 *Test Report #${RUN_NUMBER}* is ready.\"
+            }" \
+            https://slack.com/api/chat.postMessage
+
+          # 2. Get an upload URL from Slack
+          FILE_SIZE=$(wc -c < test-results/report.pdf)
+          UPLOAD_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data "filename=test-report-${RUN_NUMBER}.pdf&length=$FILE_SIZE" \
+            https://slack.com/api/files.getUploadURLExternal)
+
+          UPLOAD_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.file_id')
+
+          # 3. Upload the file content
+          curl -s -X POST "$UPLOAD_URL" \
+            --data-binary @test-results/report.pdf
+
+          # 4. Complete the upload and share to channel
+          curl -s -X POST \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"files\": [{\"id\": \"$FILE_ID\", \"title\": \"Test Report #${RUN_NUMBER}\"}],
+              \"channel_id\": \"$SLACK_CHANNEL_ID\",
+              \"initial_comment\": \"📎 Full PDF report attached.\"
+            }" \
+            https://slack.com/api/files.completeUploadExternal

@@ -1,0 +1,529 @@
+#!/usr/bin/env node
+/**
+ * testpilot-report CLI
+ *
+ * Usage:
+ *   testpilot-report --input cucumber-report.json --output reports/report.html
+ *   testpilot-report --input report.json --project "My App" --client "Acme Corp"
+ *   testpilot-report --input report.json --logo ./logo.png --notify slack
+ *   testpilot-report --input report.json --notify webhook
+ *   testpilot-report --demo
+ *
+ * Config file (testpilot.config.js in project root — CLI flags override):
+ *   module.exports = {
+ *     projectName: 'My App',
+ *     logoPath: './assets/logo.png',
+ *     environment: 'STAGING',
+ *     delivery: {
+ *       slack: { token: process.env.SLACK_BOT_TOKEN, channelId: process.env.SLACK_CHANNEL_ID },
+ *       webhook: { url: process.env.WEBHOOK_URL }
+ *     }
+ *   }
+ *
+ * Environment variables:
+ *   ANTHROPIC_API_KEY    — enables AI analysis section in the report
+ *   ANTHROPIC_MODEL      — override the Claude model (default: claude-sonnet-4-5)
+ *   TESTPILOT_ENV        — environment label shown on the report (e.g. STAGING)
+ *
+ * Slack delivery:
+ *   SLACK_BOT_TOKEN      — Bot OAuth token (xoxb-...)
+ *   SLACK_CHANNEL_ID     — Channel ID to post to (C...)
+ *
+ * Webhook delivery:
+ *   WEBHOOK_URL          — HTTP endpoint to POST report data to
+ *   WEBHOOK_TOKEN        — Optional Bearer token for the webhook
+ */
+
+import fs from 'fs';
+import path from 'path';
+import https from 'https';
+import http from 'http';
+import { TestpilotReporter } from './reporter.js';
+import { analyseResults } from './analyser.js';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface CliArgs {
+  [key: string]: string | boolean;
+}
+
+interface SlackDeliveryConfig {
+  token?: string;
+  channelId?: string;
+}
+
+interface WebhookDeliveryConfig {
+  url?: string;
+  token?: string;
+  headers?: Record<string, string>;
+}
+
+interface TestpilotConfig {
+  projectName?: string;
+  clientName?: string;
+  environment?: string;
+  logoPath?: string;
+  outputFile?: string;
+  delivery?: {
+    slack?: SlackDeliveryConfig;
+    webhook?: WebhookDeliveryConfig;
+  };
+}
+
+// ─── Load config file ─────────────────────────────────────────────────────────
+
+function loadConfig(): TestpilotConfig {
+  const configPaths = [
+    path.resolve(process.cwd(), 'testpilot.config.js'),
+    path.resolve(process.cwd(), 'testpilot.config.cjs'),
+  ];
+  for (const p of configPaths) {
+    if (fs.existsSync(p)) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const cfg = require(p) as TestpilotConfig;
+        console.log(`⚙️   Loaded config: ${path.basename(p)}`);
+        return cfg;
+      } catch (err) {
+        console.warn(`⚠️   Could not load ${p}: ${(err as Error).message}`);
+      }
+    }
+  }
+  return {};
+}
+
+// ─── Parse CLI args ───────────────────────────────────────────────────────────
+
+const args = parseArgs(process.argv.slice(2));
+
+if (args['help'] || (!args['input'] && !args['demo'])) {
+  console.log(`
+  Testpilot Reporter
+  ──────────────────
+  Usage:
+    testpilot-report --input <path>   Path to Cucumber JSON report
+    testpilot-report --demo           Generate a demo report with sample data
+
+  Options:
+    --output <path>       Output HTML file (default: testpilot-report.html)
+    --project <name>      Project name shown on cover (default: "Your Project Name")
+    --client <name>       Client / stakeholder name shown on cover (optional)
+    --environment <name>  Environment label, e.g. STAGING (also reads TESTPILOT_ENV)
+    --logo <path>         Path to a PNG/SVG/JPG logo to embed in the report header
+    --video-dir <path>    Directory containing Playwright video recordings
+    --notify slack        Post report to Slack (requires SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)
+    --notify webhook      POST report data to a webhook URL (requires WEBHOOK_URL)
+    --help                Show this help
+
+  Config file (testpilot.config.js in project root):
+    Create this file to set persistent defaults. CLI flags always override config.
+
+    module.exports = {
+      projectName: 'My App',
+      logoPath: './assets/logo.png',
+      environment: 'STAGING',
+      delivery: {
+        slack: {
+          token: process.env.SLACK_BOT_TOKEN,
+          channelId: process.env.SLACK_CHANNEL_ID,
+        },
+        webhook: {
+          url: process.env.WEBHOOK_URL,
+          token: process.env.WEBHOOK_TOKEN, // optional Bearer token
+        },
+      },
+    };
+
+  Environment variables:
+    ANTHROPIC_API_KEY       Enables AI analysis section (uses Claude)
+    ANTHROPIC_MODEL         Override Claude model (default: claude-sonnet-4-5)
+    TESTPILOT_ENV           Environment label (overridden by --environment flag)
+    SLACK_BOT_TOKEN         Slack Bot token for --notify slack
+    SLACK_CHANNEL_ID        Slack channel ID for --notify slack
+    WEBHOOK_URL             Webhook endpoint for --notify webhook
+    WEBHOOK_TOKEN           Optional Bearer token for --notify webhook
+  `);
+  process.exit(0);
+}
+
+// ─── Merge config + CLI args (flags win) ─────────────────────────────────────
+
+const cfg = loadConfig();
+
+const outputFile  = String(args['output']      ?? cfg.outputFile    ?? 'testpilot-report.html');
+const projectName = String(args['project']     ?? cfg.projectName   ?? 'Your Project Name');
+const clientName  = args['client']             ? String(args['client'])
+                  : cfg.clientName             ? cfg.clientName
+                  : null;
+const videoDir    = args['video-dir']          ? String(args['video-dir']) : null;
+const environment = args['environment']        ? String(args['environment'])
+                  : cfg.environment            ? cfg.environment
+                  : null;
+const logoPath    = args['logo']               ? String(args['logo'])
+                  : cfg.logoPath               ? cfg.logoPath
+                  : null;
+const notifyTarget = args['notify']            ? String(args['notify']) : null;
+
+const reporter = new TestpilotReporter({
+  outputFile,
+  projectName,
+  clientName: clientName ?? undefined,
+  videoDir: videoDir ?? undefined,
+  environment: environment ?? undefined,
+  logoPath: logoPath ?? undefined
+});
+
+// ─── Load test data ───────────────────────────────────────────────────────────
+
+let cucumberJson: unknown;
+
+if (args['demo']) {
+  cucumberJson = getDemoData();
+  console.log('📊 Generating demo report…');
+} else {
+  const inputPath = path.resolve(String(args['input']));
+  if (!fs.existsSync(inputPath)) {
+    console.error(`❌  File not found: ${inputPath}`);
+    process.exit(1);
+  }
+  cucumberJson = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
+  console.log(`📊 Processing: ${inputPath}`);
+}
+
+// ─── Main: parse → analyse → generate → deliver ───────────────────────────────
+
+(async () => {
+  const features = reporter.parseFeatures(cucumberJson);
+  const stats    = reporter.calculateStats(features);
+
+  const analysis = await analyseResults(features, stats, projectName);
+
+  const result = reporter.generateReport({ features, stats, analysis });
+
+  console.log(`✅  Report saved → ${result.outputFile}`);
+  console.log(`    ${stats.passed}/${stats.total} scenarios passed`);
+  if (analysis) console.log(`    AI analysis: ${analysis.overallStatus}`);
+
+  // ─── Deliver ────────────────────────────────────────────────────────────────
+  if (notifyTarget === 'slack') {
+    await deliverSlack(result.outputFile, projectName, stats, analysis, cfg.delivery?.slack);
+  } else if (notifyTarget === 'webhook') {
+    await deliverWebhook(result.outputFile, projectName, stats, analysis, cfg.delivery?.webhook);
+  } else if (notifyTarget) {
+    console.warn(`⚠️   Unknown --notify target: "${notifyTarget}". Use "slack" or "webhook".`);
+  }
+})();
+
+// ─── Slack delivery ───────────────────────────────────────────────────────────
+// Uses the 3-step Slack files API:
+//   1. files.getUploadURLExternal  → get upload URL
+//   2. PUT the file to the upload URL
+//   3. files.completeUploadExternal → attach to channel
+
+async function deliverSlack(
+  reportFile: string,
+  project: string,
+  stats: { passed: number; total: number; failed: number },
+  analysis: { overallStatus: string; clientNarrative: string } | null,
+  slackCfg?: SlackDeliveryConfig
+): Promise<void> {
+  const token     = slackCfg?.token     ?? process.env.SLACK_BOT_TOKEN;
+  const channelId = slackCfg?.channelId ?? process.env.SLACK_CHANNEL_ID;
+
+  if (!token || !channelId) {
+    console.warn('\n⚠️   Slack delivery skipped — missing SLACK_BOT_TOKEN or SLACK_CHANNEL_ID.');
+    console.warn('    Set them in env vars or in testpilot.config.js under delivery.slack.\n');
+    return;
+  }
+
+  if (!fs.existsSync(reportFile)) {
+    console.warn(`⚠️   Slack delivery skipped — report file not found: ${reportFile}`);
+    return;
+  }
+
+  const fileContent = fs.readFileSync(reportFile);
+  const fileName    = path.basename(reportFile);
+  const fileSize    = fileContent.length;
+
+  const passRate   = stats.total > 0 ? Math.round((stats.passed / stats.total) * 100) : 0;
+  const emoji      = stats.failed > 0 ? '🔴' : '🟢';
+  const statusLine = analysis
+    ? `${emoji} *${analysis.overallStatus}* — ${stats.passed}/${stats.total} passed (${passRate}%)`
+    : `${emoji} ${stats.passed}/${stats.total} scenarios passed (${passRate}%)`;
+
+  console.log('\n📤 Delivering to Slack…');
+
+  try {
+    // Step 1: get upload URL
+    const uploadUrlRes = await slackApiCall('files.getUploadURLExternal', token, {
+      filename: fileName,
+      length:   String(fileSize)
+    });
+
+    if (!uploadUrlRes.ok) {
+      throw new Error(`getUploadURLExternal failed: ${uploadUrlRes.error}`);
+    }
+
+    const { upload_url, file_id } = uploadUrlRes as { ok: boolean; upload_url: string; file_id: string; error?: string };
+
+    // Step 2: upload the file
+    await httpPut(upload_url, fileContent, 'text/html; charset=utf-8');
+
+    // Step 3: complete upload and attach to channel
+    const completeRes = await slackApiCall('files.completeUploadExternal', token, {
+      files:            JSON.stringify([{ id: file_id, title: `${project} — Test Report` }]),
+      channel_id:       channelId,
+      initial_comment:  statusLine
+    });
+
+    if (!completeRes.ok) {
+      throw new Error(`completeUploadExternal failed: ${completeRes.error}`);
+    }
+
+    console.log(`✅  Report posted to Slack channel ${channelId}`);
+  } catch (err) {
+    console.error(`❌  Slack delivery failed: ${(err as Error).message}`);
+  }
+}
+
+function slackApiCall(method: string, token: string, params: Record<string, string>): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(params).toString();
+    const options = {
+      hostname: 'slack.com',
+      path:     `/api/${method}`,
+      method:   'POST',
+      headers: {
+        'Authorization':  `Bearer ${token}`,
+        'Content-Type':   'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk: string) => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error(`Could not parse Slack response: ${data}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function httpPut(url: string, body: Buffer, contentType: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const parsed  = new URL(url);
+    const lib     = parsed.protocol === 'https:' ? https : http;
+    const options = {
+      hostname: parsed.hostname,
+      path:     parsed.pathname + parsed.search,
+      method:   'PUT',
+      headers: {
+        'Content-Type':   contentType,
+        'Content-Length': body.length
+      }
+    };
+    const req = lib.request(options, (res) => {
+      res.resume(); // drain
+      res.on('end', () => {
+        if ((res.statusCode ?? 0) >= 400) {
+          reject(new Error(`Upload failed: HTTP ${res.statusCode}`));
+        } else {
+          resolve();
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── Generic webhook delivery ─────────────────────────────────────────────────
+// POSTs a JSON payload with report metadata. The HTML file is NOT uploaded —
+// the webhook receives enough data to link to or summarise the result.
+
+async function deliverWebhook(
+  reportFile: string,
+  project: string,
+  stats: { passed: number; total: number; failed: number; skipped: number },
+  analysis: { overallStatus: string; clientNarrative: string } | null,
+  webhookCfg?: WebhookDeliveryConfig
+): Promise<void> {
+  const url   = webhookCfg?.url   ?? process.env.WEBHOOK_URL;
+  const token = webhookCfg?.token ?? process.env.WEBHOOK_TOKEN;
+
+  if (!url) {
+    console.warn('\n⚠️   Webhook delivery skipped — missing WEBHOOK_URL.');
+    console.warn('    Set it in env vars or in testpilot.config.js under delivery.webhook.\n');
+    return;
+  }
+
+  const passRate = stats.total > 0 ? Math.round((stats.passed / stats.total) * 100) : 0;
+
+  const payload = {
+    project,
+    generatedAt: new Date().toISOString(),
+    stats: { ...stats, passRate },
+    status: stats.failed > 0 ? 'FAILED' : 'PASSED',
+    analysis: analysis ? {
+      overallStatus:   analysis.overallStatus,
+      clientNarrative: analysis.clientNarrative
+    } : null,
+    reportFile: path.resolve(reportFile)
+  };
+
+  console.log('\n📤 Posting to webhook…');
+
+  try {
+    await httpPost(url, payload, token, webhookCfg?.headers);
+    console.log(`✅  Webhook delivered to ${url}`);
+  } catch (err) {
+    console.error(`❌  Webhook delivery failed: ${(err as Error).message}`);
+  }
+}
+
+function httpPost(
+  url: string,
+  payload: unknown,
+  token?: string,
+  extraHeaders?: Record<string, string>
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const body   = JSON.stringify(payload);
+    const parsed = new URL(url);
+    const lib    = parsed.protocol === 'https:' ? https : http;
+
+    const headers: Record<string, string | number> = {
+      'Content-Type':   'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      ...extraHeaders
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const options = {
+      hostname: parsed.hostname,
+      port:     parsed.port || undefined,
+      path:     parsed.pathname + parsed.search,
+      method:   'POST',
+      headers
+    };
+
+    const req = lib.request(options, (res) => {
+      res.resume();
+      res.on('end', () => {
+        if ((res.statusCode ?? 0) >= 400) {
+          reject(new Error(`Webhook returned HTTP ${res.statusCode}`));
+        } else {
+          resolve();
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── Argument parser ──────────────────────────────────────────────────────────
+
+function parseArgs(argv: string[]): CliArgs {
+  const result: CliArgs = {};
+  for (let i = 0; i < argv.length; i++) {
+    const key = argv[i];
+    if (key.startsWith('--')) {
+      const k = key.slice(2);
+      const next = argv[i + 1];
+      if (next && !next.startsWith('--')) {
+        result[k] = next;
+        i++;
+      } else {
+        result[k] = true;
+      }
+    }
+  }
+  return result;
+}
+
+// ─── Demo data ────────────────────────────────────────────────────────────────
+// Raw Cucumber JSON format — same shape as what cucumber-js outputs
+
+function getDemoData(): unknown {
+  return [
+    {
+      name: 'User Authentication',
+      description: 'Login, logout, and session management flows',
+      uri: 'features/auth.feature',
+      elements: [
+        {
+          name: 'Successful login with valid credentials',
+          tags: [{ name: '@smoke' }, { name: '@auth' }],
+          steps: [
+            { keyword: 'Given ', name: 'I am on the login page',    result: { status: 'passed', duration: 120000000 } },
+            { keyword: 'When ',  name: 'I enter valid credentials', result: { status: 'passed', duration: 80000000  } },
+            { keyword: 'Then ',  name: 'I should be logged in',     result: { status: 'passed', duration: 200000000 } }
+          ]
+        },
+        {
+          name: 'Login fails with invalid password',
+          tags: [{ name: '@auth' }],
+          steps: [
+            { keyword: 'Given ', name: 'I am on the login page',        result: { status: 'passed', duration: 110000000 } },
+            { keyword: 'When ',  name: 'I enter wrong password',        result: { status: 'passed', duration: 90000000  } },
+            { keyword: 'Then ',  name: 'I should see an error message', result: { status: 'passed', duration: 150000000 } }
+          ]
+        },
+        {
+          name: 'Session expires after timeout',
+          tags: [{ name: '@auth' }, { name: '@session' }],
+          steps: [
+            { keyword: 'Given ', name: 'I am logged in',                   result: { status: 'passed', duration: 100000000 } },
+            { keyword: 'When ',  name: 'I am inactive for 30 minutes',    result: { status: 'passed', duration: 200000000 } },
+            { keyword: 'Then ',  name: 'I should be redirected to login',  result: {
+                status: 'failed', duration: 180000000,
+                error_message: 'AssertionError: expected URL to be "/login" but got "/dashboard"\n  at Context.<anonymous> (step_definitions/auth.js:42:5)'
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      name: 'Payment Processing',
+      description: 'Stripe checkout and subscription management',
+      uri: 'features/payments.feature',
+      elements: [
+        {
+          name: 'Checkout with valid card',
+          tags: [{ name: '@smoke' }, { name: '@payments' }],
+          steps: [
+            { keyword: 'Given ', name: 'I have items in my cart',     result: { status: 'passed', duration: 300000000  } },
+            { keyword: 'When ',  name: 'I enter valid card details',  result: { status: 'passed', duration: 450000000  } },
+            { keyword: 'Then ',  name: 'Payment should be processed', result: { status: 'passed', duration: 1200000000 } }
+          ]
+        },
+        {
+          name: 'Declined card shows error',
+          tags: [{ name: '@payments' }],
+          steps: [
+            { keyword: 'Given ', name: 'I have items in my cart',      result: { status: 'passed', duration: 280000000 } },
+            { keyword: 'When ',  name: 'I enter a declined card',      result: { status: 'passed', duration: 400000000 } },
+            { keyword: 'Then ',  name: 'I should see decline message', result: { status: 'passed', duration: 300000000 } }
+          ]
+        },
+        {
+          name: 'Subscription upgrade flow',
+          tags: [{ name: '@payments' }, { name: '@subscriptions' }],
+          steps: [
+            { keyword: 'Given ', name: 'I am on a Basic plan', result: { status: 'skipped', duration: 0 } },
+            { keyword: 'When ',  name: 'I upgrade to Pro',     result: { status: 'skipped', duration: 0 } },
+            { keyword: 'Then ',  name: 'Features unlock',      result: { status: 'skipped', duration: 0 } }
+          ]
+        }
+      ]
+    }
+  ];
+}

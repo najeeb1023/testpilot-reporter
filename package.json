@@ -1,0 +1,62 @@
+{
+  "name": "testpilot-reporter",
+  "version": "1.0.0",
+  "description": "AI-powered Cucumber test reporter. Generates branded HTML + PDF reports with optional Claude analysis, and delivers them to Slack, Teams, or any webhook.",
+  "main": "dist/reporter.js",
+  "types": "dist/reporter.d.ts",
+  "bin": {
+    "testpilot-report": "dist/cli.js",
+    "testpilot-pdf": "dist/pdf-generator.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "demo": "node dist/cli.js --demo",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "cucumber",
+    "reporter",
+    "test-report",
+    "qa",
+    "html-report",
+    "pdf-report",
+    "ai",
+    "claude",
+    "anthropic",
+    "playwright",
+    "bdd",
+    "gherkin"
+  ],
+  "author": "Najeeb (https://github.com/najeeb1023)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/najeeb1023/testpilot-reporter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/najeeb1023/testpilot-reporter/issues"
+  },
+  "homepage": "https://github.com/najeeb1023/testpilot-reporter#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@cucumber/cucumber": ">=9.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@cucumber/cucumber": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "playwright": "^1.60.0",
+    "typescript": "^5.0.0"
+  }
+}
