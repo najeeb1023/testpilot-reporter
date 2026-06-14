@@ -1,6 +1,6 @@
 {
   "name": "testpilot-reporter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "AI-powered Cucumber test reporter. Generates branded HTML + PDF reports with optional Claude analysis, and delivers them to Slack, Teams, or any webhook.",
   "main": "dist/reporter.js",
   "types": "dist/reporter.d.ts",
